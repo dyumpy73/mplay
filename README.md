@@ -16,15 +16,21 @@ Compile:
   gcc -O2 -Wall -Wextra mplay.c -o mplay $(pkg-config --cflags --libs flac alsa) -lm
 
 ```
-```
+
+
 
 ## Usage
 
-    ./mplay song.flac
-    ./mplay ~/Music/album/
-    ./mplay a.flac b.flac ~/Music/other/
+```bash
+```
+  ./mplay song.flac
+  ./mplay ~/Music/album/
+  ./mplay a.flac b.flac ~/Music/other/
+```
+```
 
 ## Controls
+
 
 | Key        | Action     |
 |------------|------------|
