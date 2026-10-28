@@ -17,20 +17,15 @@ Compile:
 
 ```
 
-
-
 ## Usage
 
 ```bash
-```
   ./mplay song.flac
   ./mplay ~/Music/album/
   ./mplay a.flac b.flac ~/Music/other/
 ```
-```
 
 ## Controls
-
 
 | Key        | Action     |
 |------------|------------|
