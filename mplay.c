@@ -25,16 +25,16 @@ enum {
   ACT_ERROR = 4
 };
 
-/* ---- state PCM / ALSA ---- */
+#define POS_BAR_SEGMENTS  20
+
 static snd_pcm_t *pcm_handle = NULL;
 static int pcm_can_pause = 0;
-static unsigned pcm_bytes_per_sample = 0; /* 2 (S16) atau 4 (S32) */
-static unsigned pcm_shift = 0;            /* shift ke full-scale */
+static unsigned pcm_bytes_per_sample = 0;
+static unsigned pcm_shift = 0;
 static size_t pcm_frame_bytes = 0;
 static uint8_t *pcm_buf = NULL;
 static size_t pcm_buf_size = 0;
 
-/* ---- state playback ---- */
 static uint64_t total_samples_global = 0;
 static uint64_t current_samples = 0;
 static uint64_t seek_target_global = 0;
@@ -44,10 +44,10 @@ static volatile int user_action = ACT_NONE;
 static volatile int is_paused = 0;
 static volatile sig_atomic_t got_signal = 0;
 
-/* ---- terminal ---- */
 static struct termios orig_termios;
 static int raw_enabled = 0;
 
+/* Restore the terminal to normal (cooked) mode. */
 static void disable_raw_mode(void) {
   if (raw_enabled) {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
@@ -55,6 +55,7 @@ static void disable_raw_mode(void) {
   }
 }
 
+/* Set the terminal to raw mode so keys are read byte-by-byte without Enter. */
 static void enable_raw_mode(void) {
   if (!isatty(STDIN_FILENO)) return;
   if (tcgetattr(STDIN_FILENO, &orig_termios) < 0) return;
@@ -67,45 +68,58 @@ static void enable_raw_mode(void) {
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0) raw_enabled = 1;
 }
 
+/* Signal handler: set a flag so the main loop can exit cleanly. */
 static void signal_handler(int sig) {
   (void)sig;
   got_signal = 1;
 }
 
+/* Register handlers for SIGINT and SIGTERM without SA_RESTART. */
 static void setup_signals(void) {
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
   sa.sa_handler = signal_handler;
   sigemptyset(&sa.sa_mask);
-  sa.sa_flags = 0; /* tanpa SA_RESTART supaya syscall yang menunggu ikut terputus */
+  sa.sa_flags = 0;
   sigaction(SIGINT, &sa, NULL);
   sigaction(SIGTERM, &sa, NULL);
 }
 
-/* ---- tampilan ---- */
+/* Print playback progress and elapsed/total time on a single terminal line. */
 static void print_progress(void) {
   if (total_samples_global == 0 || sample_rate_global == 0) return;
 
   uint64_t pos = current_samples;
   if (pos > total_samples_global) pos = total_samples_global;
 
-  int progress = (int)((pos * 100) / total_samples_global);
   unsigned current_sec = (unsigned)(pos / sample_rate_global);
   unsigned total_sec = (unsigned)(total_samples_global / sample_rate_global);
 
-  printf("\r\033[K[mplay] %s %3d%% [%02u:%02u / %02u:%02u]",
-         is_paused ? "[PAUSED]" : "[PLAYING]", progress,
+  int pos_filled = (int)((pos * (uint64_t)POS_BAR_SEGMENTS + total_samples_global / 2) / total_samples_global);
+  if (pos_filled < 0) pos_filled = 0;
+  if (pos_filled > POS_BAR_SEGMENTS) pos_filled = POS_BAR_SEGMENTS;
+
+  char pos_bar[POS_BAR_SEGMENTS + 3];
+  int pidx = 0;
+  pos_bar[pidx++] = '[';
+  for (int i = 0; i < POS_BAR_SEGMENTS; i++) {
+    pos_bar[pidx++] = (i < pos_filled) ? '#' : '-';
+  }
+  pos_bar[pidx++] = ']';
+  pos_bar[pidx] = '\0';
+
+  printf("\r\033[K[mplay] %s %s [%02u:%02u / %02u:%02u]",
+         is_paused ? "[PAUSED]" : "[PLAYING]", pos_bar,
          current_sec / 60, current_sec % 60,
          total_sec / 60, total_sec % 60);
   fflush(stdout);
 }
 
-/* ---- PCM helper ---- */
+/* Pause or resume ALSA; fall back to drop/prepare if the device cannot pause. */
 static void pcm_set_pause(int pause) {
   if (!pcm_handle) return;
   if (pcm_can_pause && snd_pcm_pause(pcm_handle, pause) == 0) return;
 
-  /* Fallback kalau device tidak mendukung pause */
   if (pause) {
     snd_pcm_drop(pcm_handle);
   } else {
@@ -113,6 +127,7 @@ static void pcm_set_pause(int pause) {
   }
 }
 
+/* Write all frames to ALSA, retrying on underrun/error. */
 static int pcm_write_all(const uint8_t *p, snd_pcm_uframes_t frames) {
   while (frames > 0) {
     if (got_signal) return -1;
@@ -128,7 +143,7 @@ static int pcm_write_all(const uint8_t *p, snd_pcm_uframes_t frames) {
   return 0;
 }
 
-/* ---- keyboard ---- */
+/* Read a single byte from stdin with a timeout (ms); returns 1 on success. */
 static int read_byte(unsigned char *c, int timeout_ms) {
   fd_set fds;
   struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
@@ -138,6 +153,7 @@ static int read_byte(unsigned char *c, int timeout_ms) {
   return read(STDIN_FILENO, c, 1) == 1;
 }
 
+/* Prepare a ±5 second seek from the current position; sets the global target. */
 static int request_seek(int direction) {
   uint64_t step = (uint64_t)sample_rate_global * 5;
   uint64_t target;
@@ -154,6 +170,7 @@ static int request_seek(int direction) {
   return ACT_SEEK;
 }
 
+/* Read and process one keypress (including arrow escape sequences); returns an action. */
 static int handle_keyboard_input(void) {
   unsigned char c;
   if (!read_byte(&c, 0)) return ACT_NONE;
@@ -168,8 +185,8 @@ static int handle_keyboard_input(void) {
   if (c == '\033') {
     unsigned char s0, s1;
     if (read_byte(&s0, 20) && read_byte(&s1, 20) && s0 == '[') {
-      if (s1 == 'C') c = 'd'; /* Right Arrow */
-      else if (s1 == 'D') c = 'a'; /* Left Arrow */
+      if (s1 == 'C') c = 'd';
+      else if (s1 == 'D') c = 'a';
     }
   }
 
@@ -183,17 +200,19 @@ static int handle_keyboard_input(void) {
   }
 }
 
-/* ---- playlist ---- */
+/* Check whether the filename has a .flac extension. */
 static int is_media_file(const char *filename) {
   const char *dot = strrchr(filename, '.');
   if (!dot) return 0;
   return (strcasecmp(dot, ".flac") == 0);
 }
 
+/* Case-insensitive comparator for qsort over a list of strings. */
 static int compare_strings(const void *a, const void *b) {
   return strcasecmp(*(const char *const *)a, *(const char *const *)b);
 }
 
+/* Append a copy of filepath to the playlist (realloc the pointer array). */
 static void add_to_playlist(char ***playlist, int *count, const char *filepath) {
   char *copy = strdup(filepath);
   if (!copy) return;
@@ -208,11 +227,12 @@ static void add_to_playlist(char ***playlist, int *count, const char *filepath) 
   (*count)++;
 }
 
+/* Scan a directory for .flac files and sort them case-insensitively. */
 static void scan_directory(const char *dirpath, char ***playlist, int *count) {
   DIR *d = opendir(dirpath);
   if (!d) return;
 
-  int start = *count; /* hanya urutkan file dari direktori ini */
+  int start = *count;
   struct dirent *dir;
   char fullpath[PATH_MAX];
 
@@ -231,6 +251,7 @@ static void scan_directory(const char *dirpath, char ***playlist, int *count) {
   }
 }
 
+/* Build the playlist from argv: direct .flac files or directory contents. */
 static void build_playlist(int argc, char *argv[], char ***playlist, int *count) {
   *playlist = NULL;
   *count = 0;
@@ -247,19 +268,20 @@ static void build_playlist(int argc, char *argv[], char ***playlist, int *count)
   }
 }
 
+/* Free all playlist memory. */
 static void free_playlist(char **playlist, int count) {
   if (!playlist) return;
   for (int i = 0; i < count; i++) free(playlist[i]);
   free(playlist);
 }
 
-/* ---- FLAC callbacks ---- */
+/* FLAC metadata callback: read streaminfo and open the ALSA device. */
 static void metadata_callback(const FLAC__StreamDecoder *decoder, const FLAC__StreamMetadata *metadata, void *client_data) {
   (void)decoder;
   (void)client_data;
 
   if (metadata->type != FLAC__METADATA_TYPE_STREAMINFO) return;
-  if (pcm_handle) return; /* sudah dibuka */
+  if (pcm_handle) return;
 
   total_samples_global = metadata->data.stream_info.total_samples;
   sample_rate_global = metadata->data.stream_info.sample_rate;
@@ -284,7 +306,7 @@ static void metadata_callback(const FLAC__StreamDecoder *decoder, const FLAC__St
   if (snd_pcm_open(&h, "pulse", SND_PCM_STREAM_PLAYBACK, 0) < 0) {
     h = NULL;
     if (snd_pcm_open(&h, "default", SND_PCM_STREAM_PLAYBACK, 0) < 0) {
-      fprintf(stderr, "\n[mplay] Gagal membuka device audio.\n");
+      fprintf(stderr, "\n[mplay] Failed to open audio device.\n");
       return;
     }
   }
@@ -292,7 +314,7 @@ static void metadata_callback(const FLAC__StreamDecoder *decoder, const FLAC__St
   int err = snd_pcm_set_params(h, format, SND_PCM_ACCESS_RW_INTERLEAVED,
                                channels, sample_rate_global, 1, 500000);
   if (err < 0) {
-    fprintf(stderr, "\n[mplay] snd_pcm_set_params gagal: %s\n", snd_strerror(err));
+    fprintf(stderr, "\n[mplay] snd_pcm_set_params failed: %s\n", snd_strerror(err));
     snd_pcm_close(h);
     return;
   }
@@ -304,6 +326,7 @@ static void metadata_callback(const FLAC__StreamDecoder *decoder, const FLAC__St
   pcm_handle = h;
 }
 
+/* Compute the starting sample number of a frame (from sample or frame number). */
 static uint64_t frame_start_sample(const FLAC__Frame *frame) {
   if (frame->header.number_type == FLAC__FRAME_NUMBER_TYPE_SAMPLE_NUMBER) {
     return frame->header.number.sample_number;
@@ -311,6 +334,7 @@ static uint64_t frame_start_sample(const FLAC__Frame *frame) {
   return (uint64_t)frame->header.number.frame_number * fixed_blocksize_global;
 }
 
+/* FLAC write callback: check input, convert samples, write to ALSA. */
 static FLAC__StreamDecoderWriteStatus write_callback(const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame, const FLAC__int32 *const buffer[], void *client_data) {
   (void)decoder;
   (void)client_data;
@@ -385,12 +409,14 @@ static FLAC__StreamDecoderWriteStatus write_callback(const FLAC__StreamDecoder *
   return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
 }
 
+/* FLAC error callback: print the error message to stderr. */
 static void error_callback(const FLAC__StreamDecoder *decoder, FLAC__StreamDecoderErrorStatus status, void *client_data) {
   (void)decoder;
   (void)client_data;
   fprintf(stderr, "\n[mplay] FLAC error: %s\n", FLAC__StreamDecoderErrorStatusString[status]);
 }
 
+/* Entry point: build the playlist, then iterate over each song until done/quit. */
 int main(int argc, char *argv[]) {
   if (argc < 2) {
     printf("Usage: %s <file_or_directory> [file2 file3 ...]\n", argv[0]);
@@ -435,7 +461,7 @@ int main(int argc, char *argv[]) {
         decoder, current_file, write_callback, metadata_callback, error_callback, NULL);
 
     if (init_status != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
-      fprintf(stderr, "[mplay] Gagal membuka %s: %s\n", base,
+      fprintf(stderr, "[mplay] Failed to open %s: %s\n", base,
               FLAC__StreamDecoderInitStatusString[init_status]);
       FLAC__stream_decoder_delete(decoder);
       playlist_index++;
@@ -446,13 +472,12 @@ int main(int argc, char *argv[]) {
       FLAC__stream_decoder_process_until_end_of_stream(decoder);
       if (user_action != ACT_SEEK) break;
 
-      /* Seek dikerjakan di luar callback supaya aman */
       user_action = ACT_NONE;
       if (pcm_handle) {
-        snd_pcm_drop(pcm_handle);    /* buang buffer lama agar seek terasa instan */
+        snd_pcm_drop(pcm_handle);
         snd_pcm_prepare(pcm_handle);
       }
-      FLAC__stream_decoder_flush(decoder); /* keluar dari state ABORTED */
+      FLAC__stream_decoder_flush(decoder);
       if (!FLAC__stream_decoder_seek_absolute(decoder, seek_target_global)) {
         if (FLAC__stream_decoder_get_state(decoder) == FLAC__STREAM_DECODER_SEEK_ERROR) {
           FLAC__stream_decoder_flush(decoder);
@@ -463,9 +488,9 @@ int main(int argc, char *argv[]) {
 
     if (pcm_handle) {
       if (user_action != ACT_NONE || got_signal) {
-        snd_pcm_drop(pcm_handle);  /* berhenti langsung */
+        snd_pcm_drop(pcm_handle);
       } else {
-        snd_pcm_drain(pcm_handle); /* lagu selesai normal, habiskan buffer */
+        snd_pcm_drain(pcm_handle);
       }
       snd_pcm_close(pcm_handle);
       pcm_handle = NULL;

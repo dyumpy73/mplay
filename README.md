@@ -6,11 +6,17 @@ Minimal FLAC player for the terminal (ALSA).
 
 Install dependencies (Debian/Ubuntu):
 
-    sudo apt install libflac-dev libasound2-dev
+```bash
+  sudo apt install libflac-dev libasound2-dev
+```
 
 Compile:
 
-    gcc -O3 -Wall mplay.c -o mplay -lFLAC -lasound
+```bash
+  gcc -O2 -Wall -Wextra mplay.c -o mplay $(pkg-config --cflags --libs flac alsa) -lm
+
+```
+```
 
 ## Usage
 
